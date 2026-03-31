@@ -626,6 +626,13 @@ body.safety-mode .canvas{background-repeat:repeat!important;image-rendering:auto
 body.safety-mode .sticker{filter:drop-shadow(0 2px 6px rgba(0,0,0,0.08))!important}
 body.safety-mode .interactive-badge{animation:none!important;box-shadow:0 1px 5px rgba(0,0,0,0.18)!important}
 
+/* Runtime perf mode during active pan/drag: keep visuals identical at rest, but
+   temporarily reduce expensive effects while the user is actively interacting. */
+body.perf-interacting .sticker{transition:none!important;filter:drop-shadow(0 2px 6px rgba(0,0,0,0.08))!important}
+body.perf-interacting .zone-intro-card,
+body.perf-interacting .zone-intro-card *{animation-play-state:paused!important}
+body.perf-interacting .map-intro-glow{animation:none!important}
+
 
 /* Notebook paper extras */
 .canvas.theme-notebook::before{
@@ -6659,6 +6666,19 @@ function debounce(fn,ms){
   let t;return function(...a){clearTimeout(t);t=setTimeout(()=>fn.apply(this,a),ms)};
 }
 
+// Chunk heavy synchronous loops into frame-sized slices (prevents long tasks at startup).
+function chunkedForEach(list,fn,batchSize){
+  const items=Array.from(list||[]);
+  const size=Math.max(1,batchSize||32);
+  let i=0;
+  function runChunk(){
+    const end=Math.min(i+size,items.length);
+    for(;i<end;i++) fn(items[i],i);
+    if(i<items.length) requestAnimationFrame(runChunk);
+  }
+  runChunk();
+}
+
 // Batch DOM append via DocumentFragment
 function batchAppend(parent,elements){
   const frag=document.createDocumentFragment();
@@ -6694,6 +6714,13 @@ function clearWalkTimers(){
   if(typeof mapCanvas!=='undefined'&&mapCanvas){
     mapCanvas.querySelectorAll('[style*="z-index:9998"],[style*="z-index:9997"]').forEach(el=>el.remove());
   }
+}
+
+let _perfInteractTimer=null;
+function markPerfInteraction(){
+  document.body.classList.add('perf-interacting');
+  if(_perfInteractTimer)clearTimeout(_perfInteractTimer);
+  _perfInteractTimer=setTimeout(()=>document.body.classList.remove('perf-interacting'),180);
 }
 
 // Shared AudioContext — reuse instead of creating new ones (prevents leaks)
@@ -7582,14 +7609,14 @@ function auditStickerIntegrity(){
 
 // Add interactive badges to ALL interactive stickers
 const _allInteractive='.sticker-throne-game,.sticker-emoji-kitchen,.sticker-tlpuzzle,.sticker-vibecheck,.sticker-skillping,.sticker-startup-rand,.sticker-wheel,.sticker-quiz,.sticker-slots,.sticker-8ball,.sticker-typewriter,.sticker-dice,.sticker-lovemeter,.sticker-scratch,.sticker-mood,.sticker-counter,.sticker-fortune,.sticker-progress,.sticker[onclick],.sticker-meme[onclick]';
-document.querySelectorAll(_allInteractive).forEach(s=>{
+chunkedForEach(document.querySelectorAll(_allInteractive),s=>{
   if(s.querySelector('.interactive-badge'))return;
   if(s.style.position==='relative') s.style.position='';
   const badge=document.createElement('div');
   badge.className='interactive-badge';
   badge.textContent='🎮 PLAY';
   s.appendChild(badge);
-});
+},24);
 
 // Tilt icon stickers slightly for playful depth
 document.querySelectorAll('.sticker-emoji').forEach((s,i)=>{
@@ -7639,6 +7666,7 @@ vp.addEventListener('scroll',()=>{
   if(_scrollRAF)return;
   _scrollRAF=requestAnimationFrame(()=>{
     _scrollRAF=null;
+    markPerfInteraction();
     const now=performance.now();
     // 1) Scroll counter — throttle to every 200ms
     if(now-_lastScrollCounterUpdate>200){
@@ -7647,14 +7675,11 @@ vp.addEventListener('scroll',()=>{
       const mx=bounds.maxX,my=bounds.maxY;
       if(mx+my>0&&_scrollCounterEl)_scrollCounterEl.textContent=Math.round(((vp.scrollLeft+vp.scrollTop)/(mx+my))*100);
     }
-    // 2) Map update — throttle to every 100ms, redraw every 800ms
+    // 2) Map update — throttle to every 100ms
     if(typeof updMap==='function'&&typeof mapTransitioning!=='undefined'&&!mapTransitioning){
       if(now-_lastMapUpdate>100){
         _lastMapUpdate=now;
         updMap();
-      }
-      if(typeof mmExp!=='undefined'&&!mmExp){
-        clearTimeout(window._mapScrollTimer);window._mapScrollTimer=setTimeout(drawMap,800);
       }
     }
   });
@@ -7669,6 +7694,7 @@ vp.addEventListener('mousedown',e=>{
 });
 document.addEventListener('mousemove',e=>{
   if(!iD)return;e.preventDefault();
+  markPerfInteraction();
   _dragPendingX=e.clientX;_dragPendingY=e.clientY;
   if(!_dragRAF){
     _dragRAF=requestAnimationFrame(()=>{
@@ -7807,6 +7833,7 @@ function _schedStickerMove(e){
   }
   if(isRotating)return;
   if(e.cancelable)e.preventDefault();
+  markPerfInteraction();
   if(_stickerMoveRAF)return;
   _stickerMoveRAF=requestAnimationFrame(()=>{
     _stickerMoveRAF=null;
@@ -8519,7 +8546,7 @@ _stickerObserver.observe(cv,{childList:true});
 function scanStickers(){
   stickerData=[];
   const sigParts=[];
-  const stickers=document.querySelectorAll('#canvas > .sticker');
+  const stickers=getAllStickers();
   stickers.forEach(s=>{
     if(!s.dataset.mapId){
       _mapStickerIdCounter++;
@@ -8640,7 +8667,9 @@ function scanStickers(){
   const nextSig=sigParts.join('|');
   if(nextSig!==_mapDataSignature){
     _mapDataSignature=nextSig;
-    invalidateMapCloneCache(true);
+    // Keep existing clone nodes and let renderVisibleClones reuse/reposition them.
+    // This avoids expensive full DOM teardown/rebuild after every layout tweak.
+    invalidateMapCloneCache(false);
   }
 }
 
@@ -9383,7 +9412,14 @@ function drawMap(){
       invalidateMapCloneCache(true);
     }
     renderAllSmallMapClones(sc,offsetX,offsetY,canvasW,canvasH);
-    if(mapCount)mapCount.textContent=Array.from(stickerData).filter(d=>mFilt==='all'||matchesFilter(d.cat,mFilt)).length+' items';
+    if(mapCount){
+      let count=0;
+      for(let i=0;i<stickerData.length;i++){
+        const d=stickerData[i];
+        if(mFilt==='all'||matchesFilter(d.cat,mFilt))count++;
+      }
+      mapCount.textContent=count+' items';
+    }
     // Use cached SVG overlays
     getOrCreateSmallMapSvgs(canvasW,canvasH);
   }
@@ -9396,10 +9432,12 @@ function renderAllSmallMapClones(sc,ox,oy,cw,ch){
   const frag=document.createDocumentFragment();
   let visibleCount=0;
   const activeCloneIds=new Set();
+  const baseScale=Math.max(sc,0.01);
   stickerData.forEach(d=>{
     if(mFilt!=='all'&&!matchesFilter(d.cat,mFilt))return;
-    const liveLeft=d.ref&&d.ref.style?parseInt(d.ref.style.left)||d.left:d.left;
-    const liveTop=d.ref&&d.ref.style?parseInt(d.ref.style.top)||d.top:d.top;
+    const isDragging=!!(d.ref&&d.ref.classList&&d.ref.classList.contains('dragging'));
+    const liveLeft=isDragging&&d.ref&&d.ref.style?(parseInt(d.ref.style.left)||d.left):d.left;
+    const liveTop=isDragging&&d.ref&&d.ref.style?(parseInt(d.ref.style.top)||d.top):d.top;
     const renderX=(liveLeft-ox)*sc;
     const renderY=(liveTop-oy)*sc;
     const cloneId=d.id||(d.left+'-'+d.top+'-'+d.cat);
@@ -9409,7 +9447,6 @@ function renderAllSmallMapClones(sc,ox,oy,cw,ch){
       clone=makeMapCloneNode(d);
       _mapCloneNodesById.set(cloneId,clone);
     }
-    const baseScale=Math.max(sc,0.01);
     const finalScale=computeCloneScale(d,baseScale);
     applyClonePlacement(clone,d,renderX,renderY,finalScale);
     clone.style.display='block';
@@ -9502,6 +9539,14 @@ function makeMapCloneNode(d){
   clone.style.pointerEvents='auto';
   clone.style.touchAction='manipulation';
   clone.dataset.mapCloneId=d.id||'';
+  clone.style.width=d.w+'px';
+  clone.style.height=d.h+'px';
+  clone._mapW=d.w;
+  clone._mapH=d.h;
+  clone._mapX=NaN;
+  clone._mapY=NaN;
+  clone._mapScale=NaN;
+  clone._mapRot='';
   const activateClone=(ev)=>{
     ev.preventDefault();
     ev.stopPropagation();
@@ -9523,13 +9568,21 @@ function makeMapCloneNode(d){
 
 function applyClonePlacement(clone,d,x,y,scale){
   const rot=(d.ref&&d.ref.style.transform?d.ref.style.transform:'').match(/rotate\([^)]+\)/);
-  clone.style.left=x+'px';
-  clone.style.top=y+'px';
-  clone.style.width=d.w+'px';
-  clone.style.height=d.h+'px';
+  const roundedX=Math.round(x*10)/10;
+  const roundedY=Math.round(y*10)/10;
+  const roundedScale=Math.round(scale*10000)/10000;
+  const rotText=rot?rot[0]:'';
+  if(clone._mapX!==roundedX){clone.style.left=roundedX+'px';clone._mapX=roundedX;}
+  if(clone._mapY!==roundedY){clone.style.top=roundedY+'px';clone._mapY=roundedY;}
+  if(clone._mapW!==d.w){clone.style.width=d.w+'px';clone._mapW=d.w;}
+  if(clone._mapH!==d.h){clone.style.height=d.h+'px';clone._mapH=d.h;}
   clone.style.display='block';
   clone.style.transformOrigin='0 0';
-  clone.style.transform=(rot?rot[0]+' ':'')+'scale('+scale+')';
+  if(clone._mapScale!==roundedScale||clone._mapRot!==rotText){
+    clone.style.transform=(rotText?rotText+' ':'')+'scale('+roundedScale+')';
+    clone._mapScale=roundedScale;
+    clone._mapRot=rotText;
+  }
 }
 
 function renderVisibleClones(sc,ox,oy,cw,ch){
@@ -9556,15 +9609,16 @@ function renderVisibleClones(sc,ox,oy,cw,ch){
   const visibleIds=new Set();
   const frag=document.createDocumentFragment();
   let visibleCount=0;
+  const baseScale=Math.max(sc,0.01);
 
   stickerData.forEach(d=>{
     if(mFilt!=='all'&&!matchesFilter(d.cat,mFilt))return;
-    // Read LIVE position from DOM ref for accurate placement
-    const liveLeft=d.ref&&d.ref.style?parseInt(d.ref.style.left)||d.left:d.left;
-    const liveTop=d.ref&&d.ref.style?parseInt(d.ref.style.top)||d.top:d.top;
+    // Use cached scan positions for normal rendering; only read live style during active drag.
+    const isDragging=!!(d.ref&&d.ref.classList&&d.ref.classList.contains('dragging'));
+    const liveLeft=isDragging&&d.ref&&d.ref.style?(parseInt(d.ref.style.left)||d.left):d.left;
+    const liveTop=isDragging&&d.ref&&d.ref.style?(parseInt(d.ref.style.top)||d.top):d.top;
     const renderX=(liveLeft-ox)*sc;
     const renderY=(liveTop-oy)*sc;
-    const baseScale=Math.max(sc,0.01);
     const finalScale=computeCloneScale(d,baseScale);
     const iw=Math.max(d.w*finalScale,2);
     const ih=Math.max(d.h*finalScale,2);
@@ -10206,6 +10260,7 @@ let _lastCloneRenderLeft=0;
 let _lastCloneRenderTop=0;
 // Re-render visible clones when scrolling expanded map
 document.getElementById('mmInner').addEventListener('scroll',()=>{
+  markPerfInteraction();
   if(mapTransitioning)return;
   if(mmExp&&drawMap._sc){
     const ox=drawMap._ox||0,oy=drawMap._oy||0,sc=drawMap._sc;
@@ -10245,8 +10300,18 @@ document.getElementById('mmInner').addEventListener('scroll',()=>{
 // Map scroll update is handled by the unified scroll handler above (near line 3587)
 
 // getAC() already defined above in performance utilities section
+const _sfxCooldownByType=new Map();
+function canPlaySfx(type){
+  const now=performance.now();
+  const minGap=(type==='pop'||type==='click')?40:90;
+  const last=_sfxCooldownByType.get(type)||0;
+  if(now-last<minGap)return false;
+  _sfxCooldownByType.set(type,now);
+  return true;
+}
 
 function playSfx(type){
+  if(!canPlaySfx(type))return;
   try{
     const ac=getAC(),t=ac.currentTime;
     if(type==='click'){const o=ac.createOscillator();o.type='sine';o.frequency.setValueAtTime(800,t);o.frequency.exponentialRampToValueAtTime(1200,t+0.05);const g=ac.createGain();g.gain.setValueAtTime(0.3,t);g.gain.exponentialRampToValueAtTime(0.001,t+0.08);o.connect(g);g.connect(ac.destination);o.start(t);o.stop(t+0.08)}
@@ -11426,7 +11491,7 @@ function buildZoneCardHTML(meta){return '';}
 // ===== Add drag handles to all interactive sticker cards =====
 (function(){
   const interactiveSelectors='.sticker-throne-game,.sticker-emoji-kitchen,.sticker-tlpuzzle,.sticker-vibecheck,.sticker-skillping,.sticker-startup-rand,.sticker-wheel,.sticker-quiz,.sticker-slots,.sticker-8ball,.sticker-typewriter,.sticker-dice,.sticker-lovemeter,.sticker-scratch,.sticker-mood,.sticker-counter,.sticker-fortune,.sticker-progress,.sticker[onclick],.sticker-meme[onclick]';
-  document.querySelectorAll(interactiveSelectors).forEach(s=>{
+  chunkedForEach(document.querySelectorAll(interactiveSelectors),s=>{
     if(s.classList.contains('has-drag-handle'))return;
     s.classList.add('has-drag-handle');
     if(s.style.position==='relative') s.style.position='';
@@ -11434,7 +11499,7 @@ function buildZoneCardHTML(meta){return '';}
     handle.className='sticker-drag-handle';
     handle.innerHTML='<svg viewBox="0 0 24 24" fill="currentColor"><circle cx="9" cy="6" r="1.5"/><circle cx="15" cy="6" r="1.5"/><circle cx="9" cy="12" r="1.5"/><circle cx="15" cy="12" r="1.5"/><circle cx="9" cy="18" r="1.5"/><circle cx="15" cy="18" r="1.5"/></svg>';
     s.insertBefore(handle,s.firstChild);
-  });
+  },20);
 })();
 
 setTimeout(async ()=>{
@@ -11444,9 +11509,8 @@ setTimeout(async ()=>{
   await bootstrapMap(true);
   // Re-center on intro card AFTER items are rearranged
   scrollToZone(null,'hub');
-  requestAnimationFrame(()=>scrollToZone(null,'hub'));
-  setTimeout(()=>{scrollToZone(null,'hub');centerOnIntroCard();},350);
-  setTimeout(()=>{scrollToZone(null,'hub');centerOnIntroCard();},900);
+  requestAnimationFrame(()=>centerOnIntroCard());
+  setTimeout(()=>centerOnIntroCard(),350);
   // Show bitmoji greeting
   const greet=document.createElement('div');
   greet.className='bitmoji-greeting';
